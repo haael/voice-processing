@@ -7,9 +7,6 @@ from sys import argv
 
 url = argv[1]
 
-#'https://m.youtube.com/@TheAngryAstronaut'
-#'https://m.youtube.com/@Astrofaza',
-
 
 tn = 2
 suffix = 'shorts'
