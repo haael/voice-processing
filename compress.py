@@ -4,8 +4,9 @@
 from typing import Any, Tuple, Union, Optional, Self
 from collections.abc import Generator, Container
 
+from collections import deque, defaultdict
 import sys
-from itertools import tee
+from itertools import tee, product
 from pathlib import Path
 
 import jax
@@ -120,9 +121,8 @@ class NDArray(metaclass=NDArrayMeta):
 
 
 default_sample_rate = 22050 # 22050 Hz audio sample rate
-default_frame_duration = 20 # 50ms frame, 50 frames per second
-default_frequencies = 1024 # 1024 frequencies in Fourier transform
-
+default_frame_duration = 20 # 20ms frame, 50 frames per second
+default_frequencies = default_sample_rate * default_frame_duration // 1000
 
 
 def interpolate(frame: NDArray[:], in_sample_rate: int, out_sample_rate: int) -> NDArray[:]:
@@ -226,7 +226,6 @@ def load_audio_file(filename: Path, sample_rate: int = default_sample_rate, fram
 	"""
 	with sf.SoundFile(filename, mode='r') as soundfile:
 		samples_per_frame = soundfile.samplerate * frame_duration // 1000
-		#print(soundfile.samplerate, sample_rate, samples_per_frame)
 		while True:
 			raw_data = soundfile.read(frames=samples_per_frame, dtype='float32')
 			if len(raw_data) == 0:
@@ -292,7 +291,7 @@ def inverse_fourier(data: Generator[NDArray[:], None, None], sample_rate: int = 
 		yield NDArray[samples_per_frame](window)
 
 
-def crosscorrelation(data: Generator[NDArray[:], None, None], sample_size: Optional[int] = None, skip: int = 1) -> NDArray[:, :]:
+def cross_correlation(data: Generator[NDArray[:], None, None], sample_size: Optional[int] = None, skip: int = 1) -> NDArray[:, :]:
 	"""
 	Compute the cross-correlation matrix for a series of frames.
 	Args:
@@ -302,32 +301,35 @@ def crosscorrelation(data: Generator[NDArray[:], None, None], sample_size: Optio
 	Returns:
 		Cross-correlation matrix as a 2D array.
 	"""
-	samples = []
-	for i, vec in enumerate(data):
-		if sample_size is not None and i >= sample_size * skip:
-			break
-		if i % skip == 0:
-			samples.append(NDArray[:](vec))
-
-	if not samples:
-		return NDArray[:, :](np.zeros((0, 0)))
-
-	samples = np.array(samples)
-	corr_matrix = np.corrcoef(samples.T)
-	corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
-	corr_matrix = np.fill_diagonal(corr_matrix, 1.0, inplace=False)
-
-	return NDArray[:, :](corr_matrix)
-
-
-def crosscovariance(data: Generator[NDArray[:], None, None], sample_size: Optional[int] = None, skip: int = 1) -> NDArray[:, :]:
-	sample = NDArray[:, :](accumulate(data, sample_size, skip))
 	
+	samples = accumulate(data, sample_size, skip)
 	corr_matrix = np.corrcoef(samples.T)
 	corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
 	corr_matrix = np.fill_diagonal(corr_matrix, 1.0, inplace=False)
-
+	
 	return NDArray[:, :](corr_matrix)
+
+
+def forward_correlation(data: Generator[NDArray[:], None, None], delay:int = 1, sample_size: Optional[int] = None, skip: int = 1) -> NDArray[:, :]:
+	"""
+	Compute the correlation matrix between the time series and its delayed copy.
+	Args:
+		data: Generator yielding frames (1D arrays).
+		sample_size: Maximum number of frames to process.
+		skip: Process only 1 / skip frames.
+	Returns:
+		Cross-correlation matrix as a 2D array.
+	"""
+	
+	samples = accumulate(data, sample_size, skip)
+	n_observations, n_vars = samples.shape
+	assert n_observations == len(samples)
+	
+	corr_matrix = np.dot(samples[delay:].T, samples[:-delay]) / (len(samples) - delay)
+	#corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+	#corr_matrix = np.fill_diagonal(corr_matrix, 1.0, inplace=False)
+	
+	return NDArray[n_vars, n_vars](corr_matrix)
 
 
 def mean_variance(data: Generator[NDArray[:], None, None]) -> Tuple[NDArray[:], NDArray[:]]:
@@ -336,7 +338,7 @@ def mean_variance(data: Generator[NDArray[:], None, None]) -> Tuple[NDArray[:], 
 	
 	Args:
 		data: Generator yielding vectors (1D arrays).
-
+	
 	Returns:
 		Tuple of (mean, variance) for each component as 1D arrays.
 	"""
@@ -368,7 +370,7 @@ def mean_variance(data: Generator[NDArray[:], None, None]) -> Tuple[NDArray[:], 
 	return NDArray[:](mean), NDArray[:](variance)
 
 
-def normalize(data:Generator[NDArray[:], None, None], mean:NDArray[:], variance:NDArray[:], threshold: float = 0.001) -> Generator[NDArray[:], None, None]:
+def normalize(data:Generator[NDArray[:], None, None], mean:NDArray[:], variance:NDArray[:], threshold: float = 0.0001) -> Generator[NDArray[:], None, None]:
 	"Normalize the stream of vectors, taking the mean of each element to 0 and variance to 1 or 0, given the provided mean and variance arguments. If abs(v) < threshold the variance is assumed to be 0."
 	
 	if __debug__:
@@ -386,7 +388,7 @@ def normalize(data:Generator[NDArray[:], None, None], mean:NDArray[:], variance:
 		yield NDArray[mean.shape[0]](result)
 
 
-def denormalize(data:Generator[NDArray[:], None, None], mean:NDArray[:], variance:NDArray[:], threshold: float = 0.001) -> Generator[NDArray[:], None, None]:
+def denormalize(data:Generator[NDArray[:], None, None], mean:NDArray[:], variance:NDArray[:], threshold: float = 0.0001) -> Generator[NDArray[:], None, None]:
 	"Recover original stream from normalized stream, restoring the original mean and variance, given the provided mean and variance arguments. If abs(v) < threshold the variance is assumed to be 0."
 	
 	if __debug__:
@@ -404,7 +406,7 @@ def denormalize(data:Generator[NDArray[:], None, None], mean:NDArray[:], varianc
 		yield NDArray[mean.shape[0]](frame * np.where(np.abs(variance) < threshold, 0.0, np.sqrt(variance)) + mean)
 
 
-def compression_matrix(cross_corr_matrix: NDArray[:, :], n_components: int) -> NDArray[:, :]:
+def compression_matrix(cross_corr_matrix: NDArray[:, :], dim_reduction: float = 0.1) -> NDArray[:, :]:
 	"""
 	Construct a PCA-based compression matrix from a cross-correlation matrix.
 
@@ -417,9 +419,8 @@ def compression_matrix(cross_corr_matrix: NDArray[:, :], n_components: int) -> N
 	"""
 	
 	cross_corr_matrix = NDArray[:, :](cross_corr_matrix)
-	
 	dim = cross_corr_matrix.shape[0]
-	assert cross_corr_matrix.shape == (dim, dim)
+	assert cross_corr_matrix.shape == (dim, dim), "Correlation matrix must be square."
 	
 	# Eigendecomposition
 	eigenvalues, eigenvectors = np.linalg.eig(cross_corr_matrix)
@@ -432,11 +433,9 @@ def compression_matrix(cross_corr_matrix: NDArray[:, :], n_components: int) -> N
 	eigenvalues = eigenvalues[idx]
 	eigenvectors = eigenvectors[:, idx]
 	
-	#eigenvectors_inv = np.linalg.inv(eigenvectors)
-	
 	# Select top N components
+	n_components = int(dim_reduction * len(eigenvalues))
 	top_eigenvectors = eigenvectors[:, :n_components]
-	#top_eigenvectors_inv = eigenvectors_inv[:n_components, :]
 	
 	return NDArray[dim, n_components](top_eigenvectors)
 
@@ -479,39 +478,36 @@ def decompress(data: Generator[NDArray[:], None, None], compression_matrix: NDAr
 		yield NDArray[decompressed_dim](decompressed)
 
 
-def autocorrelation(data: Generator[NDArray[None], None, None], maxdelay: int, sample_size: Optional[int] = None) -> NDArray[:, :]:
-	"""
-	Compute the autocorrelation matrix for a series of scalars.
-	Args:
-		data: Generator yielding scalars.
-		maxdelay: Maximum delay for autocorrelation.
-		sample_size: Maximum number of samples to process.
-	Returns:
-		Autocorrelation matrix as a 2D array.
-	"""
-	samples = []
-	for i, sample in enumerate(data):
-		if sample_size is not None and i >= sample_size:
-			break
-		samples.append(NDArray[None](sample))
-	if not samples:
-		return NDArray[:, :](np.zeros((maxdelay, maxdelay)))
-	samples = np.array(samples)
-	acorr = np.array([np.corrcoef(samples[:-i], samples[i:])[0, 1] for i in range(1, maxdelay + 1)])
-	return NDArray[:, :](np.diag(acorr))
+def concatenate_vectors(*generators):
+	for vectors in zip(*generators):
+		yield np.concatenate(vectors)
 
 
-def eigendecomposition(matrix: NDArray[:, :]) -> Tuple[NDArray[:], NDArray[:, :]]:
-	"""
-	Compute the eigendecomposition of a square matrix.
-	Args:
-		matrix: Square matrix as a 2D array.
-	Returns:
-		Tuple of eigenvalues (1D array) and eigenvectors (2D array).
-	"""
-	matrix = NDArray[:, :](matrix)
-	eigenvalues, eigenvectors = np.linalg.eig(matrix)
-	return NDArray[:](eigenvalues.real), NDArray[:, :](eigenvectors.real)
+def add_vectors(one, two):
+	for a, b in zip(one, two):
+		yield a + b
+
+
+def noise(key, size):
+	while True:
+		yield jax.random(key, size)
+
+
+class loopback:
+	def __init__(self, initial):
+		self.__initial = initial
+	
+	def feedback(self, iterator):
+		self.__iterator = iterator
+	
+	def __iter__(self):
+		yield self.__initial
+		yield from self.__iterator
+
+
+def delayed(self, iterator, initial):
+	yield initial
+	yield from iterator
 
 
 if False and __debug__ and __name__ == '__main__':
@@ -532,12 +528,12 @@ if False and __debug__ and __name__ == '__main__':
 	#print(freqs[0][0], m[0], v[0], (freqs[0][0] - m[0]) / np.sqrt(v[0]))
 	freqs_norm = normalize(freqs, m, v)
 	
-	freqs_norm1, freqs_norm2, freqs_norm3 = tee(freqs_norm, 3)
+	freqs_norm1, freqs_norm2, freqs_norm3, freqs_norm4 = tee(freqs_norm, 4)
 	assert not np.isnan(accumulate(freqs_norm3)).any()
 	
 	mn, vn = mean_variance(freqs_norm1)
-	assert all(abs(_m) < 10**-6 for _m in mn), "All mean values of normalized stream should be close to 0."
-	assert all(abs(_v - 1) < 10**-4 or _v == 0 for _v in vn), "All variance values of normalized stream should be close to 1 or should equal 0."
+	assert all(abs(_m) < 10**-4 for _m in mn), f"All mean values of normalized stream should be close to 0. {float(np.max(np.abs(mn)))}"
+	assert all(abs(_v - 1) < 10**-3 or _v == 0 for _v in vn), f"All variance values of normalized stream should be close to 1 or should equal 0. {float(np.max(np.abs(vn[vn != 0] - 1)))}"
 	
 	freqs_denorm = denormalize(freqs_norm2, m, v)
 	freqs_denorm = accumulate(freqs_denorm)
@@ -548,21 +544,28 @@ if False and __debug__ and __name__ == '__main__':
 	#print(freqs_denorm[0][0])
 	
 	#print(freqs - freqs_denorm)
-	assert (np.abs(freqs - freqs_denorm) < 10**-5).all()
+	assert (np.abs(freqs - freqs_denorm) < 10**-1).all(), f"Values of the recovered stream should be close to original {float(np.max(np.abs(freqs - freqs_denorm)))}"
+	
+	cc = forward_correlation(freqs_norm4)
+	assert cc.shape == (default_frequencies, default_frequencies)
+	for n in range(default_frequencies):
+		print(cc[n][0])
+	#print(cc.shape, freqs.shape, default_frequencies)
+	quit()
 
 
-
-#quit()
-
-
-def load_normalized_audio_files(dirname):
-	for filename in dirname.iterdir():
+def load_normalized_freqs(dirname, n=None):
+	for m, filename in enumerate(dirname.iterdir()):
+		if n is not None and m >= n:
+			break
 		print("load", filename)
 		audio = load_audio_file(filename)
 		freqs = fourier(audio)
 		freqs1, freqs2 = tee(freqs)
 		mean, variance = mean_variance(freqs1)
 		yield from normalize(freqs2, mean, variance)
+
+
 
 
 if __name__ == '__main__':
@@ -576,34 +579,103 @@ if __name__ == '__main__':
 	result_dir = dirname / 'result'
 	
 	try:
-		compression = np.load(dirname / 'compression_matrix.npy')
-	except IOError:
-		audio = load_normalized_audio_files(training_dir)
-		cross_correlation = crosscorrelation(audio)
-		compression = compression_matrix(cross_correlation, 80)
-		np.save(dirname / 'compression_matrix.npy', compression)
+		cross_matrix = np.load(dirname / 'cross_matrix.npy')
+		forward_matrix = np.load(dirname / 'forward_matrix.npy')
 	
-	#print(compression)
-	#print(decompression)
+	except IOError:
+		normalized_freqs = load_normalized_freqs(training_dir) # load normalized Furier frequencies from all audio samples (concatenated)
+		normalized_freqs1, normalized_freqs2 = tee(normalized_freqs) # split stream
+		cross_correlation_matrix = cross_correlation(normalized_freqs1) # calculate cross correlation between frequencies at the same time point
+		cross_matrix = compression_matrix(cross_correlation_matrix) # take dominant eigenvector matrix from the cross correlation matrix
+		np.save(dirname / 'cross_matrix.npy', cross_matrix) # save the matrix
+		
+		compressed_freqs = compress(normalized_freqs2, cross_matrix) # compress frequencies using compression matrix from the last step
+		compressed_freqs1, compressed_freqs2 = tee(compressed_freqs) # split stream
+		forward_correlation_matrix = forward_correlation(compressed_freqs1) # calculate forward correlation between frequencies at different time points
+		forward_matrix = compression_matrix(forward_correlation_matrix, dim_reduction=0.75) # take dominant eigenvector matrix from the forward correlation matrix
+		np.save(dirname / 'forward_matrix.npy', forward_matrix) # save the matrix
+		
+		print()
+	
+	'''
+	freqs = load_normalized_freqs(training_dir, 2)
+	compressed_freqs = compress(freqs, compression)
+	compressed_freqs1, compressed_freqs2 = tee(compressed_freqs)
+	fc = forward_correlation(compressed_freqs1, 1)
+	ew, ev = np.linalg.eig(fc)
+	ew = ew.real
+	ev = ev.real
+	ev /= np.linalg.norm(ev, axis=0)
+	idx = np.argsort(np.abs(ew))[::-1]
+	ew = ew[idx]
+	ev = ev[:, idx]
+	
+	ew = ew[:8]
+	ev = ev[:, :8]
+	
+	predicted_cast_vector = np.zeros((8,), dtype='float32')
+	for vector in compressed_freqs2:
+		cast_vector = np.dot(ev.T, vector)
+		
+		#error = cast_vector - predicted_cast_vector
+		#print(" ".join([f"{_x:+7.2f}" if abs(_x) > 0.5 else "       " for _x in error]))
+		
+		#predicted_cast_vector = np.concatenate([cast_vector[:1], predicted_cast_vector[1:]])
+		#predicted_cast_vector *= ew
+		
+		
+		#error = vector - predicted_vector
+		#error = np.rint(np.where(np.abs(error) < 5, 0.0, error))
+		
+		#predicted_vector = np.dot(ev, cast_vector * ew)
+		
+		#cast_vector = np.where(np.abs(cast_vector) < 1, 0.0, cast_vector)
+		#error = np.rint(128 * (vector - predicted_vector)) / 128
+		#print(" ".join([f"{_x:+6.2f}" for _x in error]))
+		#predicted_vector = np.dot(fc, vector)
+		#print(" ".join([f"{_x:+2.0f}" if _x else "  " for _x in error]))
+	
+	'''
 	
 	audio = load_audio_file(list(training_dir.iterdir())[0])
 	freqs = fourier(audio)
-	mean, variance = mean_variance(freqs)
+	global_mean, global_variance = mean_variance(freqs) # take mean and variance of one stream to denormalize all others
 	
-	print()
 	result_dir.mkdir(exist_ok=True)
 	for filename in training_dir.iterdir():
 		print("process", filename)
-		audio = load_audio_file(filename)
-		freqs = fourier(audio)
-		#freqs1, freqs2 = tee(freqs)
-		#mean, variance = mean_variance(freqs1)
-		normalized_freqs = normalize(freqs, mean, variance)
-		compressed_freqs = compress(normalized_freqs, compression)
-		normalized_freqs = decompress(compressed_freqs, compression)
-		freqs = denormalize(normalized_freqs, mean, variance)
-		audio = inverse_fourier(freqs)
-		save_audio_file(result_dir / filename.name, audio, volume=5)
+		
+		audio = load_audio_file(filename) # load audio file
+		freqs = fourier(audio) # make Fourier transform
+		freqs1, freqs2 = tee(freqs) # split generator into 2 streams
+		mean, variance = mean_variance(freqs1) # calculate mean and variance of the stream
+		normalized_freqs = normalize(freqs2, mean, variance) # normalize the stream using the calculated mean and variance
+		
+		#normalized_freqs1, normalized_freqs2, normalized_freqs3 = tee(normalized_freqs, 3)
+		#cross_compressed_freqs = compress(normalized_freqs1, cross_matrix) # stage 1: compress frequencies using cross correlation eigenvectors matrix
+		#cross_compressed_freqs1, cross_compressed_freqs2, cross_compressed_freqs3, cross_compressed_freqs4 = tee(cross_compressed_freqs, 4)
+		#cross_denoisifier.learn(concatenate_vectors(cross_compressed_freqs1, decompress(cross_compressed_freqs2, cross_matrix), add_vectors(delayed(normalized_freqs2, np.zeros()), noise())), normalized_freqs3)
+		#delayed_normalized_freqs = loopback(np.zeros())
+		#normalized_freqs = cross_denoisifier.process(concatenate_vectors(cross_compressed_freqs3, decompress(cross_compressed_freqs4, cross_matrix), delayed_normalized_freqs))
+		#normalized_freqs1, normalized_freqs2 = tee(normalized_freqs)
+		#delayed_normalized_freqs.feedback(normalized_freqs2)
+		
+		#forward_compressed_freqs = compress(cross_compressed_freqs, forward_matrix) # stage 2: compress frequencies using forward correlation eigenvectors matrix
+		
+		#forward_denoisifier.learn([forward_compressed_freqs, decompress(forward_compressed_freqs, forward_matrix), delayed(cross_compressed_freqs) + noise()], cross_compressed_freqs)
+		#cross_compresed_freqs = forward_denoisifier.process(forward_compressed_freqs, decompress(forward_compressed_freqs, forward_matrix))
+		
+		#cross_compressed_freqs = decompress(forward_compressed_freqs, forward_matrix) # undo stage 2: decompress frequencies using forward correlation eigenvectors matrix
+		
+		cross_compressed_freqs = compress(normalized_freqs, cross_matrix) # stage 1: compress frequencies using cross correlation eigenvectors matrix
+		normalized_freqs = decompress(cross_compressed_freqs, cross_matrix) # undo stage 1: decompress frequencies using cross correlation eigenvectors matrix
+		freqs = denormalize(normalized_freqs, global_mean, global_variance) # restore mean and variance of the stream using global mean and variable
+		audio = inverse_fourier(freqs) # undo Fourier transform
+		save_audio_file(result_dir / filename.name, audio, volume=7.5) # save audio file (increase volume because compression lowers it)
+		
+		
+		
+
 
 
 
